@@ -1,0 +1,194 @@
+import cv2
+import numpy as np
+import mediapipe as mp
+import tkinter as tk
+from tkinter import Label
+from PIL import Image, ImageTk
+import sys
+
+# -------------------- Mediapipe Setup --------------------
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(
+    static_image_mode=False,
+    max_num_faces=1,
+    refine_landmarks=True
+)
+
+# -------------------- Thresholds --------------------
+EAR_THRESHOLD = 0.2
+MAR_THRESHOLD = 0.6
+CONSEC_FRAMES = 5
+
+# -------------------- Counters --------------------
+frame_count = 0
+yawn_count = 0
+eye_closed_count = 0
+yawn_times = 0
+
+# -------------------- Landmark Indices --------------------
+left_eye_indices = [33, 160, 158, 133, 153, 144]
+right_eye_indices = [362, 385, 387, 263, 373, 380]
+mouth_indices = [61, 291, 13, 14]
+
+# -------------------- EAR Calculation --------------------
+def calculate_EAR(landmarks, indices, frame_width, frame_height):
+    eye = np.array([
+        (landmarks[i].x * frame_width, landmarks[i].y * frame_height)
+        for i in indices
+    ])
+    hor_distance = np.linalg.norm(eye[0] - eye[3])
+    ver_distance1 = np.linalg.norm(eye[1] - eye[5])
+    ver_distance2 = np.linalg.norm(eye[2] - eye[4])
+
+    return (ver_distance1 + ver_distance2) / (2.0 * hor_distance)
+
+# -------------------- MAR Calculation --------------------
+def calculate_MAR(landmarks, indices, frame_width, frame_height):
+    mouth = np.array([
+        (landmarks[i].x * frame_width, landmarks[i].y * frame_height)
+        for i in indices
+    ])
+    hor_distance = np.linalg.norm(mouth[0] - mouth[1])
+    ver_distance = np.linalg.norm(mouth[2] - mouth[3])
+
+    return ver_distance / hor_distance
+
+# -------------------- Tkinter Setup --------------------
+window = tk.Tk()
+window.title("Driver Drowsiness and Yawning Detection")
+window.configure(bg="lightblue")
+
+status_frame = tk.Frame(window, bg="lightblue")
+status_frame.pack(pady=10)
+
+title_label = Label(status_frame, text="Driver Drowsiness Detection",
+                    font=("Helvetica", 16), bg="lightblue")
+title_label.grid(row=0, column=0, pady=10)
+
+status_label = Label(status_frame,
+                     text="Status: Waiting...",
+                     font=("Helvetica", 14),
+                     bg="lightblue")
+status_label.grid(row=1, column=0)
+
+eye_closed_label = Label(status_frame,
+                         text="Eye Closed Count: 0",
+                         font=("Helvetica", 12),
+                         bg="lightblue")
+eye_closed_label.grid(row=2, column=0)
+
+yawn_label = Label(status_frame,
+                   text="Yawning Count: 0",
+                   font=("Helvetica", 12),
+                   bg="lightblue")
+yawn_label.grid(row=3, column=0)
+
+video_label = Label(window)
+video_label.pack(pady=10)
+
+# -------------------- Camera --------------------
+cap = cv2.VideoCapture(0)
+is_live = False
+
+# -------------------- Buttons --------------------
+def toggle_live_detection():
+    global is_live
+    is_live = not is_live
+    if is_live:
+        start_button_text.set("Stop Live")
+    else:
+        start_button_text.set("Start Live")
+
+def exit_application():
+    cap.release()
+    window.quit()
+    cv2.destroyAllWindows()
+
+button_frame = tk.Frame(window, bg="lightblue")
+button_frame.pack(pady=10)
+
+start_button_text = tk.StringVar()
+start_button_text.set("Start Live")
+
+start_button = tk.Button(button_frame,
+                         textvariable=start_button_text,
+                         command=toggle_live_detection,
+                         font=("Helvetica", 14))
+start_button.pack()
+
+exit_button = tk.Button(button_frame,
+                        text="Exit",
+                        command=exit_application,
+                        font=("Helvetica", 14))
+exit_button.pack(pady=5)
+
+# -------------------- Update Frame --------------------
+def update_frame():
+    global frame_count, yawn_count, eye_closed_count, yawn_times
+
+    if is_live:
+        success, frame = cap.read()
+        if not success:
+            return
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = face_mesh.process(rgb_frame)
+        frame_height, frame_width, _ = frame.shape
+
+        status = "Active"
+
+        if results.multi_face_landmarks:
+            for face_landmarks in results.multi_face_landmarks:
+
+                left_EAR = calculate_EAR(face_landmarks.landmark,
+                                         left_eye_indices,
+                                         frame_width, frame_height)
+                right_EAR = calculate_EAR(face_landmarks.landmark,
+                                          right_eye_indices,
+                                          frame_width, frame_height)
+
+                EAR = (left_EAR + right_EAR) / 2.0
+                MAR = calculate_MAR(face_landmarks.landmark,
+                                    mouth_indices,
+                                    frame_width, frame_height)
+
+                # ---- Eye Detection ----
+                if EAR < EAR_THRESHOLD:
+                    frame_count += 1
+                    if frame_count >= CONSEC_FRAMES:
+                        status = "DROWSY - Eyes Closed!"
+                        eye_closed_count += 1
+                        eye_closed_label.config(
+                            text=f"Eye Closed Count: {eye_closed_count}"
+                        )
+                else:
+                    frame_count = 0
+
+                # ---- Yawning Detection ----
+                if MAR > MAR_THRESHOLD:
+                    yawn_count += 1
+                    if yawn_count > 3:
+                        status = "DROWSY - Yawning!"
+                        yawn_times += 1
+                        yawn_label.config(
+                            text=f"Yawning Count: {yawn_times}"
+                        )
+                else:
+                    yawn_count = 0
+
+        status_label.config(text=f"Status: {status}")
+
+        # Convert to Tkinter format
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(frame_rgb)
+        imgtk = ImageTk.PhotoImage(image=img)
+        video_label.imgtk = imgtk
+        video_label.configure(image=imgtk)
+
+    window.after(10, update_frame)
+
+update_frame()
+window.mainloop()
+
+cap.release()
+cv2.destroyAllWindows()
