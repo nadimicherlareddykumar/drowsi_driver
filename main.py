@@ -4,7 +4,7 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import tkinter as tk
-from tkinter import Label, Button, Frame
+from tkinter import Label, Button, Frame, Scrollbar, Text
 from PIL import Image, ImageTk
 import sys
 import os
@@ -12,418 +12,527 @@ import time
 import threading
 import queue
 import winsound
+import csv
+from datetime import datetime
+import pyttsx3
+
+# -------------------- Voice Engine --------------------
+class VoiceEngine:
+    def __init__(self):
+        self.engine = pyttsx3.init()
+        # Set property for a clearer voice
+        voices = self.engine.getProperty('voices')
+        if len(voices) > 1:
+            # Usually voice[1] is female which sounds clearer for navigation/assistants
+            self.engine.setProperty('voice', voices[1].id)
+        self.engine.setProperty('rate', 160)
+        self.last_voice_time = 0
+
+    def say(self, text, cooldown=3):
+        """Speaks the text only if the cooldown has passed."""
+        if time.time() - self.last_voice_time > cooldown:
+            def _speak():
+                try:
+                    engine = pyttsx3.init()
+                    engine.say(text)
+                    engine.runAndWait()
+                except:
+                    pass
+            threading.Thread(target=_speak, daemon=True).start()
+            self.last_voice_time = time.time()
 
 # -------------------- Mediapipe Task Setup --------------------
-model_path = 'face_landmarker.task'
-base_options = python.BaseOptions(model_asset_path=model_path)
-options = vision.FaceLandmarkerOptions(
-    base_options=base_options,
-    output_face_blendshapes=True,
-    output_facial_transformation_matrixes=True,
-    num_faces=1
-)
-detector = vision.FaceLandmarker.create_from_options(options)
-
-# -------------------- Initial Thresholds (Will be calibrated) --------------------
-EAR_THRESHOLD = 0.2
-MAR_THRESHOLD = 0.6
-CONSEC_FRAMES = 20
+MODEL_PATH = 'face_landmarker.task'
+LOG_FILE = 'driver_session_log.csv'
 
 # -------------------- Landmark Indices --------------------
-left_eye_indices = [33, 160, 158, 133, 153, 144]
-right_eye_indices = [362, 385, 387, 263, 373, 380]
-mouth_indices = [61, 291, 13, 14]
+LEFT_EYE = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+MOUTH = [61, 291, 13, 14]
 
-# -------------------- EAR / MAR Calculation --------------------
-def calculate_EAR(landmarks, indices, frame_width, frame_height):
-    eye = np.array([
-        (landmarks[i].x * frame_width, landmarks[i].y * frame_height)
-        for i in indices
-    ])
-    hor_distance = np.linalg.norm(eye[0] - eye[3])
-    ver_distance1 = np.linalg.norm(eye[1] - eye[5])
-    ver_distance2 = np.linalg.norm(eye[2] - eye[4])
-    return (ver_distance1 + ver_distance2) / (2.0 * hor_distance)
+# -------------------- Adaptive Threshold Manager --------------------
+class AdaptiveThresholdManager:
+    """Continuously learns from the environment to adjust EAR/MAR thresholds."""
+    def __init__(self):
+        self.ear_baseline_history = []
+        self.mar_baseline_history = []
+        self.window_size = 300  # ~10 seconds at 30fps
+        self.current_ear_threshold = 0.2
+        self.current_mar_threshold = 0.6
+        self.is_ready = False
 
-def calculate_MAR(landmarks, indices, frame_width, frame_height):
-    mouth = np.array([
-        (landmarks[i].x * frame_width, landmarks[i].y * frame_height)
-        for i in indices
-    ])
-    hor_distance = np.linalg.norm(mouth[0] - mouth[1])
-    ver_distance = np.linalg.norm(mouth[2] - mouth[3])
-    return ver_distance / hor_distance
+    def update(self, raw_ear, raw_mar, is_relaxed=True):
+        if is_relaxed:
+            self.ear_baseline_history.append(raw_ear)
+            self.mar_baseline_history.append(raw_mar)
+            
+            if len(self.ear_baseline_history) > self.window_size:
+                self.ear_baseline_history.pop(0)
+                self.mar_baseline_history.pop(0)
+                self.is_ready = True
 
-# -------------------- Rotation Extraction --------------------
-def get_euler_angles(matrix):
-    # MediaPipe Face Landmarker transformation matrix to Euler angles (Pitch, Yaw, Roll)
-    # The matrix is 4x4. The top-left 3x3 is rotation.
-    r = matrix[:3, :3]
-    sy = np.sqrt(r[0, 0]**2 + r[1, 0]**2)
-    singular = sy < 1e-6
-    if not singular:
-        x = np.arctan2(r[2, 1], r[2, 2])
-        y = np.arctan2(-r[2, 0], sy)
-        z = np.arctan2(r[1, 0], r[0, 0])
-    else:
-        x = np.arctan2(-r[1, 2], r[1, 1])
-        y = np.arctan2(-r[2, 0], sy)
-        z = 0
-    return np.degrees(x), np.degrees(y), np.degrees(z)
+            if self.is_ready:
+                # Set threshold to 70% of the rolling average for eyes
+                avg_ear = sum(self.ear_baseline_history) / len(self.ear_baseline_history)
+                # Set threshold to 160% of the rolling average for mouth
+                avg_mar = sum(self.mar_baseline_history) / len(self.mar_baseline_history)
+                
+                self.current_ear_threshold = avg_ear * 0.72
+                self.current_mar_threshold = avg_mar * 1.65
 
-# -------------------- Detection Class (Background Thread) --------------------
-class DrowsinessDetector:
+# -------------------- Session Logger --------------------
+class SessionLogger:
+    def __init__(self, filename):
+        self.filename = filename
+        if not os.path.exists(self.filename):
+            with open(self.filename, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Timestamp', 'Event Type', 'Duration (s)', 'Details'])
+
+    def log_event(self, event_type, duration=0, details=""):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(self.filename, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([timestamp, event_type, duration, details])
+
+# -------------------- Core Agent Engine --------------------
+class DriverAgent:
     def __init__(self, cap):
         self.cap = cap
         self.running = False
         self.result_queue = queue.Queue(maxsize=1)
+        self.logger = SessionLogger(LOG_FILE)
+        self.adapter = AdaptiveThresholdManager()
+        self.voice = VoiceEngine()
         
-        # Calibration state
-        self.is_calibrating = False
-        self.calibration_frames = []
-        self.calibration_msg = ""
+        # Detector Setup
+        base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
+        options = vision.FaceLandmarkerOptions(
+            base_options=base_options,
+            output_face_blendshapes=True,
+            output_facial_transformation_matrixes=True,
+            num_faces=1
+        )
+        self.detector = vision.FaceLandmarker.create_from_options(options)
+
+        # State Tracking
+        self.eye_closed_start = None
+        self.mouth_open_start = None
+        self.distracted_start = None
+        self.face_missing_start = None
         
-        # Event states
-        self.eye_closed_frames = 0
-        self.mouth_open_frames = 0
-        self.is_drowsy_event = False
-        self.is_yawning_event = False
-        
-        # Counters (Discrete Events)
-        self.eye_closed_count = 0
+        # Performance/Stats
+        self.drowsy_count = 0
         self.yawn_count = 0
         self.distraction_count = 0
+        self.alertness_score = 100.0  # PERCLOS based score
+        self.closure_history = []  # Binary (1 for closed, 0 for open)
         
-        # Jitter reduction / Smoothing
-        self.ear_history = []
-        self.mar_history = []
-        self.yaw_history = []
-        self.pitch_history = []
-        self.history_size = 5 # Frames to average
-        
-        # Distraction tracking
-        self.distracted_frames = 0
-        self.is_distracted_event = False
-        
-        # Audio Alert state
-        self.alert_active = False
+        # For smoothing UI numbers
+        self.smooth_ear = 0.3
+        self.smooth_mar = 0.1
 
     def start(self):
         self.running = True
-        self.thread = threading.Thread(target=self._process, daemon=True)
+        self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def stop(self):
         self.running = False
 
-    def trigger_calibration(self):
-        self.is_calibrating = True
-        self.calibration_frames = []
-
-    def _play_alert(self):
-        if not self.alert_active:
-            self.alert_active = True
-            threading.Thread(target=self._async_beep, daemon=True).start()
-
-    def _async_beep(self):
-        # High pitched beep for attention
-        winsound.Beep(1500, 500)
-        self.alert_active = False
-
-    def _process(self):
-        global EAR_THRESHOLD, MAR_THRESHOLD
-        prev_time = time.time()
+    def _calculate_metrics(self, landmarks, w, h):
+        # EAR calculation
+        l_eye = np.array([(landmarks[i].x * w, landmarks[i].y * h) for i in LEFT_EYE])
+        r_eye = np.array([(landmarks[i].x * w, landmarks[i].y * h) for i in RIGHT_EYE])
         
+        def eye_ear(eye):
+            v1 = np.linalg.norm(eye[1] - eye[5])
+            v2 = np.linalg.norm(eye[2] - eye[4])
+            hor = np.linalg.norm(eye[0] - eye[3])
+            return (v1 + v2) / (2.0 * hor)
+        
+        ear = (eye_ear(l_eye) + eye_ear(r_eye)) / 2.0
+        
+        # MAR calculation
+        mouth = np.array([(landmarks[i].x * w, landmarks[i].y * h) for i in MOUTH])
+        m_hor = np.linalg.norm(mouth[0] - mouth[1])
+        m_ver = np.linalg.norm(mouth[2] - mouth[3])
+        mar = m_ver / m_hor
+        
+        return ear, mar
+
+    def _get_pose(self, matrix):
+        m = np.array(matrix).reshape(4,4)[:3, :3]
+        sy = np.sqrt(m[0, 0]**2 + m[1, 0]**2)
+        if sy > 1e-6:
+            x = np.arctan2(m[2, 1], m[2, 2])
+            y = np.arctan2(-m[2, 0], sy)
+            z = np.arctan2(m[1, 0], m[0, 0])
+        else:
+            x = np.arctan2(-m[1, 2], m[1, 1])
+            y = np.arctan2(-m[2, 0], sy)
+            z = 0
+        return np.degrees(x), np.degrees(y), np.degrees(z)
+
+    def _draw_overlay(self, frame, landmarks, status, pose):
+        h, w, _ = frame.shape
+        # Draw tech-style corners
+        color = (0, 255, 204) if "Active" in status else (0, 100, 255)
+        if "DROWSY" in status or "WARNING" in status: color = (0, 0, 255)
+
+        # Draw a subtle face contour
+        for i in range(len(landmarks)):
+            px = int(landmarks[i].x * w)
+            py = int(landmarks[i].y * h)
+            if i % 15 == 0: # Only draw some points for "pro" look
+                cv2.circle(frame, (px, py), 1, color, -1)
+
+        # --- 3D Gaze Projection ---
+        # We project a line from the nose tip (idx 1) based on head pose
+        pitch, yaw, _ = pose
+        nose = landmarks[1]
+        cx, cy = int(nose.x * w), int(nose.y * h)
+        
+        # Calculate endpoint based on yaw/pitch
+        length = 100
+        # Yaw: Left/Right (X), Pitch: Up/Down (Y)
+        ex = int(cx + length * np.sin(np.radians(-yaw)))
+        ey = int(cy + length * np.sin(np.radians(pitch)))
+        
+        cv2.line(frame, (cx, cy), (ex, ey), color, 2)
+        cv2.circle(frame, (ex, ey), 4, color, -1) # "Target" dot
+        
+        return frame
+
+    def _apply_night_vision(self, frame):
+        # Convert to LAB for better contrast adjustment
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        
+        # Calculate brightness
+        avg_brightness = np.mean(l)
+        if avg_brightness < 80: # If dark
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+            cl = clahe.apply(l)
+            limg = cv2.merge((cl,a,b))
+            return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR), True
+        return frame, False
+
+    def _take_snapshot(self, frame, event_name):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"crisis_logs/CRISIS_{event_name}_{timestamp}.jpg"
+        cv2.imwrite(filename, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        self.logger.log_event("SNAPSHOT_SAVED", 0, filename)
+
+    def _run(self):
+        prev_time = time.time()
         while self.running:
-            success, frame = self.cap.read()
-            if not success:
-                continue
+            success, raw_frame = self.cap.read()
+            if not success: continue
 
-            # Performance monitoring
-            start_inference = time.time()
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-            detection_result = detector.detect(mp_image)
-            inference_time = (time.time() - start_inference) * 1000
+            # Night Vision Enhancement
+            frame, night_mode = self._apply_night_vision(raw_frame)
+
+            img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+            res = self.detector.detect(mp_img)
             
-            # FPS
-            curr_time = time.time()
-            fps = 1.0 / (curr_time - prev_time) if curr_time > prev_time else 0
-            prev_time = curr_time
-
-            status = "Active"
-            frame_height, frame_width, _ = frame.shape
+            status = "Continuous Learning..."
+            h, w, _ = frame.shape
+            pose = (0, 0, 0)
             
-            if detection_result.face_landmarks:
-                face_landmarks = detection_result.face_landmarks[0]
+            if res.face_landmarks:
+                self.face_missing_start = None
+                marks = res.face_landmarks[0]
+                ear, mar = self._calculate_metrics(marks, w, h)
                 
-                # Face Size Check (Distance Proxy)
-                # Distance between left-most and right-most landmarks (indices 234 and 454)
-                face_width = np.linalg.norm(
-                    np.array([face_landmarks[234].x, face_landmarks[234].y]) -
-                    np.array([face_landmarks[454].x, face_landmarks[454].y])
-                ) * frame_width
+                # Update adaptive thresholds
+                # Only update baseline if the user is NOT currently in an event
+                self.adapter.update(ear, mar, is_relaxed=(self.eye_closed_start == None))
                 
-                if face_width < 100: # Threshold for "too far"
-                    status = "TOO FAR - Move Closer"
+                # Smoothing for UI
+                self.smooth_ear = self.smooth_ear * 0.8 + ear * 0.2
+                self.smooth_mar = self.smooth_mar * 0.8 + mar * 0.2
                 
-                raw_ear = (calculate_EAR(face_landmarks, left_eye_indices, frame_width, frame_height) +
-                           calculate_EAR(face_landmarks, right_eye_indices, frame_width, frame_height)) / 2.0
-                raw_mar = calculate_MAR(face_landmarks, mouth_indices, frame_width, frame_height)
+                # Head Pose
+                if res.facial_transformation_matrixes:
+                    pose = self._get_pose(res.facial_transformation_matrixes[0].data)
                 
-                # Apply Smoothing
-                self.ear_history.append(raw_ear)
-                self.mar_history.append(raw_mar)
-                if len(self.ear_history) > self.history_size: self.ear_history.pop(0)
-                if len(self.mar_history) > self.history_size: self.mar_history.pop(0)
+                pitch, yaw, _ = pose
                 
-                ear = sum(self.ear_history) / len(self.ear_history)
-                mar = sum(self.mar_history) / len(self.mar_history)
+                # --- DETECTION LOGIC ---
+                curr_status = "Active"
                 
-                # Head Pose Logic
-                yaw, pitch, roll = 0, 0, 0
-                if detection_result.facial_transformation_matrixes:
-                    matrix = detection_result.facial_transformation_matrixes[0].data
-                    # Reshape if necessary (MediaPipe might return flattened)
-                    matrix = np.array(matrix).reshape(4,4)
-                    pitch, yaw, roll = get_euler_angles(matrix)
-                
-                self.yaw_history.append(yaw)
-                self.pitch_history.append(pitch)
-                if len(self.yaw_history) > self.history_size: self.yaw_history.pop(0)
-                if len(self.pitch_history) > self.history_size: self.pitch_history.pop(0)
-                
-                avg_yaw = sum(self.yaw_history) / len(self.yaw_history)
-                avg_pitch = sum(self.pitch_history) / len(self.pitch_history)
-
-                # Calibration Logic
-                if self.is_calibrating:
-                    # Only collect if face is actually detected
-                    self.calibration_frames.append((ear, mar))
-                    progress = int((len(self.calibration_frames) / 60.0) * 100)
-                    self.calibration_msg = f"CALIBRATING... {progress}%"
-                    status = self.calibration_msg
-                    
-                    if len(self.calibration_frames) >= 60:
-                        avg_ear = sum(f[0] for f in self.calibration_frames) / 60
-                        avg_mar = sum(f[1] for f in self.calibration_frames) / 60
-                        EAR_THRESHOLD = avg_ear * 0.70
-                        MAR_THRESHOLD = avg_mar * 1.6
-                        self.is_calibrating = False
-                        self.calibration_msg = "CALIBRATION COMPLETE!"
-                        print(f"Calibrated: EAR={EAR_THRESHOLD:.2f}, MAR={MAR_THRESHOLD:.2f}")
-                        sys.stdout.flush()
-                
+                # 1. Drowsiness (EAR)
+                if ear < self.adapter.current_ear_threshold:
+                    if self.eye_closed_start is None: self.eye_closed_start = time.time()
+                    duration = time.time() - self.eye_closed_start
+                    if duration > 1.0: # 1 second threshold
+                        curr_status = "DROWSY - WAKE UP!"
+                        winsound.Beep(2000, 200)
+                        self.voice.say("Drowsiness detected. Open your eyes.")
+                        self.closure_history.append(1)
+                        if duration > 2.5 and not hasattr(self, '_snap_done'):
+                            self._take_snapshot(img_rgb, "DROWSY")
+                            self._snap_done = True
+                    else: self.closure_history.append(0)
                 else:
-                    if self.calibration_msg:
-                        status = self.calibration_msg
-                        # Clear message after some time
-                        if not hasattr(self, 'msg_timer'): self.msg_timer = 0
-                        self.msg_timer += 1
-                        if self.msg_timer > 60:
-                            self.calibration_msg = ""
-                            self.msg_timer = 0
-                    
-                    # Eye Drowsiness Logic (Discrete Event)
-                    # Eye Drowsiness Logic (Discrete Event)
-                    if ear < EAR_THRESHOLD:
-                        self.eye_closed_frames += 1
-                        if self.eye_closed_frames >= CONSEC_FRAMES:
-                            status = "DROWSY - Eyes Closed!"
-                            self._play_alert()
-                            if not self.is_drowsy_event:
-                                self.eye_closed_count += 1
-                                self.is_drowsy_event = True
-                    else:
-                        self.eye_closed_frames = 0
-                        self.is_drowsy_event = False
+                    if hasattr(self, '_snap_done'): delattr(self, '_snap_done')
+                    if self.eye_closed_start:
+                        dur = time.time() - self.eye_closed_start
+                        if dur > 1.0:
+                            self.drowsy_count += 1
+                            self.logger.log_event("DROWSY", round(dur, 2), f"EAR: {ear:.2f}")
+                            if self.drowsy_count % 3 == 0:
+                                self.voice.say("You have multiple drowsy events. Please consider a coffee break.")
+                    self.eye_closed_start = None
+                    self.closure_history.append(0)
 
-                    # Yawning Logic (Discrete Event)
-                    if mar > MAR_THRESHOLD:
-                        self.mouth_open_frames += 1
-                        if self.mouth_open_frames >= 4:
-                            status = "DROWSY - Yawning!"
-                            self._play_alert()
-                            if not self.is_yawning_event:
-                                self.yawn_count += 1
-                                self.is_yawning_event = True
-                    else:
-                        self.mouth_open_frames = 0
-                        self.is_yawning_event = False
+                # 2. Yawning (MAR)
+                if mar > self.adapter.current_mar_threshold:
+                    if self.mouth_open_start is None: self.mouth_open_start = time.time()
+                    if (time.time() - self.mouth_open_start) > 2.0:
+                        curr_status = "YAWNING DETECTED"
+                        winsound.Beep(1000, 100)
+                        self.voice.say("Yawning detected. Fatigue is increasing.")
+                else:
+                    if self.mouth_open_start:
+                        dur = time.time() - self.mouth_open_start
+                        if dur > 2.0:
+                            self.yawn_count += 1
+                            self.logger.log_event("YAWN", round(dur, 2))
+                    self.mouth_open_start = None
 
-                    # Distraction Detection (Head Turned)
-                    # Thresholds: Yaw > 25 (Left/Right), Pitch > 20 (Up/Down)
-                    if abs(avg_yaw) > 25 or abs(avg_pitch) > 20:
-                        self.distracted_frames += 1
-                        if self.distracted_frames >= 45: # ~1.5 seconds
-                            status = "WARNING: DISTRACTED!"
-                            self._play_alert()
-                            if not self.is_distracted_event:
-                                self.distraction_count += 1
-                                self.is_distracted_event = True
-                    else:
-                        self.distracted_frames = 0
-                        self.is_distracted_event = False
+                # 3. Distraction (Pose)
+                if abs(yaw) > 25 or abs(pitch) > 18:
+                    if self.distracted_start is None: self.distracted_start = time.time()
+                    if (time.time() - self.distracted_start) > 1.5:
+                        curr_status = "WATCH THE ROAD!"
+                        winsound.Beep(1500, 150)
+                        self.voice.say("Keep your eyes on the road.")
+                else:
+                    if self.distracted_start:
+                        dur = time.time() - self.distracted_start
+                        if dur > 1.5:
+                            self.distraction_count += 1
+                            self.logger.log_event("DISTRACTION", round(dur, 2), f"Yaw: {yaw:.0f}")
+                    self.distracted_start = None
                 
-            else:
-                status = "Face Not Detected"
+                status = curr_status
+                frame_draw = self._draw_overlay(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), marks, status, pose)
+                frame = cv2.cvtColor(frame_draw, cv2.COLOR_BGR2RGB)
+                
+                # Calculate Alertness Score (PERCLOS)
+                if len(self.closure_history) > 600: self.closure_history.pop(0)
+                if len(self.closure_history) > 0:
+                    perclos = (sum(self.closure_history) / len(self.closure_history)) * 100
+                    self.alertness_score = max(0, 100 - (perclos * 5)) # Weighted reduction
 
-            # Prepare data for GUI
-            result = {
-                'frame': rgb_frame,
+            else:
+                if self.face_missing_start is None:
+                    self.face_missing_start = time.time()
+                
+                missing_dur = time.time() - self.face_missing_start
+                if missing_dur > 1.5:
+                    status = "FACE OBSTRUCTED / MISSING"
+                    winsound.Beep(2500, 200)
+                    self.voice.say("Face obstructed. Please keep your face visible.")
+                else:
+                    status = "Searching for face..."
+                
+                self.closure_history.append(0)
+                if len(self.closure_history) > 600: self.closure_history.pop(0)
+
+            # Package result
+            inf_time = (time.time() - prev_time)
+            fps = 1.0 / inf_time if inf_time > 0 else 0
+            prev_time = time.time()
+            
+            res_pkg = {
+                'frame': frame,
                 'status': status,
                 'fps': fps,
-                'latency': inference_time,
-                'accuracy': 99.0 if detection_result.face_landmarks else 0.0,
-                'eye_count': self.eye_closed_count,
-                'yawn_count': self.yawn_count,
-                'dist_count': self.distraction_count,
-                'pose': (avg_pitch, avg_yaw, roll)
+                'ear': self.smooth_ear,
+                'mar': self.smooth_mar,
+                'score': self.alertness_score,
+                'counts': (self.drowsy_count, self.yawn_count, self.distraction_count),
+                'pose': pose,
+                'thresholds': (self.adapter.current_ear_threshold, self.adapter.current_mar_threshold),
+                'night': night_mode
             }
             
-            # Put in queue (overwrite if full to stay real-time)
             if self.result_queue.full():
                 try: self.result_queue.get_nowait()
-                except queue.Empty: pass
-            self.result_queue.put(result)
+                except: pass
+            self.result_queue.put(res_pkg)
 
-# -------------------- GUI Logic --------------------
-class App:
-    def __init__(self, window):
-        self.window = window
-        self.window.title("Advanced Driver Monitor (V2)")
-        self.window.configure(bg="#1e1e1e") # Dark theme for premium look
+# -------------------- GUI --------------------
+class DRI01App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("AGENT DRI01 - Driver Intelligence Agent")
+        self.root.geometry("1100x700")
+        self.root.configure(bg="#0a0a0a")
         
-        # Camera init
-        self.cap, _ = self._init_camera()
-        self.detector_logic = DrowsinessDetector(self.cap)
+        self.cap = self._init_cap()
+        if self.cap:
+            self.agent = DriverAgent(self.cap)
+        else:
+            self.agent = None
+            print("CRITICAL: All camera initialization attempts failed.")
         
-        self._setup_ui()
-        self._update()
+        self._build_ui()
+        self._tick()
 
-    def _init_camera(self):
-        for idx in [0, 1, 2]:
-            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-            if cap.isOpened(): return cap, idx
-            cap.release()
-            cap = cv2.VideoCapture(idx)
-            if cap.isOpened(): return cap, idx
-            cap.release()
-        return None, None
+    def _init_cap(self):
+        # Fallback sequence for Windows camera backends
+        attempts = [
+            (0, cv2.CAP_DSHOW),
+            (0, cv2.CAP_MSMF),
+            (0, None),
+            (1, cv2.CAP_DSHOW),
+            (1, None)
+        ]
+        
+        for idx, backend in attempts:
+            try:
+                cap = cv2.VideoCapture(idx, backend) if backend is not None else cv2.VideoCapture(idx)
+                if cap.isOpened():
+                    # Verification read
+                    ret, _ = cap.read()
+                    if ret:
+                        print(f"Camera initialized successfully on index {idx} with backend {backend}")
+                        return cap
+                    cap.release()
+            except Exception as e:
+                print(f"Failed to init camera {idx} with {backend}: {e}")
+                continue
+        return None
 
-    def _on_calibrate(self):
-        if not self.detector_logic.running:
-            self._toggle() # Start camera if not running
-        self.detector_logic.trigger_calibration()
-        self.status_label.config(text="Status: Preparing Calibration...", fg="#00ccff")
+    def _build_ui(self):
+        # Top bar
+        top = Frame(self.root, bg="#0a0a0a", height=60)
+        top.pack(fill="x", side="top", pady=10)
+        Label(top, text="AGENT DRI01", font=("Consolas", 24, "bold"), fg="#00ffcc", bg="#0a0a0a").pack(side="left", padx=20)
+        self.time_lbl = Label(top, text="", font=("Consolas", 12), fg="#888", bg="#0a0a0a")
+        self.time_lbl.pack(side="right", padx=20)
 
-    def _setup_ui(self):
-        # Header
-        header = Frame(self.window, bg="#1e1e1e")
-        header.pack(fill="x", pady=10)
-        Label(header, text="DRIVER MONITORING SYSTEM", font=("Helvetica", 18, "bold"), fg="#00ffcc", bg="#1e1e1e").pack()
+        # Main Layout
+        main_frame = Frame(self.root, bg="#0a0a0a")
+        main_frame.pack(fill="both", expand=True, padx=10)
         
-        # Status Label
-        self.status_label = Label(self.window, text="Status: Ready", font=("Helvetica", 16), fg="white", bg="#1e1e1e")
-        self.status_label.pack(pady=5)
+        # Left: Video
+        self.vid_lbl = Label(main_frame, text="SYSTEM INITIALIZED\n\nCLICK 'ACTIVATE AGENT' TO START MONITORING", 
+                             fg="#00ffcc", bg="black", font=("Consolas", 14), borderwidth=0)
+        self.vid_lbl.pack(side="left", fill="both", expand=True)
         
-        # Stats Frame
-        stats_frame = Frame(self.window, bg="#2d2d2d", padx=20, pady=10)
-        stats_frame.pack(pady=10)
-        self.eye_label = Label(stats_frame, text="Drowsy Events: 0", font=("Helvetica", 12), fg="#ff6666", bg="#2d2d2d")
-        self.eye_label.grid(row=0, column=0, padx=20)
-        self.yawn_label = Label(stats_frame, text="Yawn Events: 0", font=("Helvetica", 12), fg="#ffcc66", bg="#2d2d2d")
-        self.yawn_label.grid(row=0, column=1, padx=20)
-        self.dist_label = Label(stats_frame, text="Distraction: 0", font=("Helvetica", 12), fg="#cc66ff", bg="#2d2d2d")
-        self.dist_label.grid(row=0, column=2, padx=20)
+        # Right: Dashboard
+        dash = Frame(main_frame, bg="#121212", width=300)
+        dash.pack(side="right", fill="y", padx=10)
+        dash.pack_propagate(False)
+
+        # Alertness Score
+        Label(dash, text="DRIVER ALERTNESS", font=("Consolas", 10), fg="#aaa", bg="#121212").pack(pady=(20,0))
+        self.score_lbl = Label(dash, text="100%", font=("Consolas", 48, "bold"), fg="#00ffcc", bg="#121212")
+        self.score_lbl.pack()
         
-        # Pose Label
-        self.pose_label = Label(self.window, text="Direction: Center", font=("Helvetica", 10), fg="#aaa", bg="#1e1e1e")
-        self.pose_label.pack()
+        # Stats List
+        self.stat_frame = Frame(dash, bg="#121212")
+        self.stat_frame.pack(fill="x", pady=20, padx=10)
         
-        # Video Display
-        self.video_label = Label(self.window, bg="black", borderwidth=2, relief="solid")
-        self.video_label.pack(pady=10, padx=20)
+        self._add_stat("DROWSY EVENTS", "0", "#ff4444", 0)
+        self._add_stat("YAWN EVENTS", "0", "#ffaa00", 1)
+        self._add_stat("DISTRACTIONS", "0", "#aa44ff", 2)
+
+        # Threshold Learning Info
+        self.learn_lbl = Label(dash, text="Agent Level: Learning...", font=("Consolas", 9), fg="#666", bg="#121212", wraplength=250)
+        self.learn_lbl.pack(side="bottom", pady=20)
+
+        # Telemetry Labels
+        self.tel_lbl = Label(dash, text="EAR: 0.00 | MAR: 0.00", font=("Consolas", 9), fg="#888", bg="#121212")
+        self.tel_lbl.pack(side="bottom")
+
+        # Control Bar
+        bot = Frame(self.root, bg="#0a0a0a", height=80)
+        bot.pack(fill="x", side="bottom")
         
-        # Performance Frame
-        perf_frame = Frame(self.window, bg="#1e1e1e")
-        perf_frame.pack(pady=5)
-        self.fps_label = Label(perf_frame, text="FPS: 0", font=("Helvetica", 9), fg="#888", bg="#1e1e1e")
-        self.fps_label.grid(row=0, column=0, padx=10)
-        self.lat_label = Label(perf_frame, text="Lat: 0ms", font=("Helvetica", 9), fg="#888", bg="#1e1e1e")
-        self.lat_label.grid(row=0, column=1, padx=10)
-        self.acc_label = Label(perf_frame, text="Confidence: 0%", font=("Helvetica", 9), fg="#888", bg="#1e1e1e")
-        self.acc_label.grid(row=0, column=2, padx=10)
+        self.btn_run = Button(bot, text="ACTIVATE AGENT", command=self._toggle, font=("Consolas", 12, "bold"), bg="#00ffcc", fg="#000", width=20, relief="flat")
+        self.btn_run.pack(side="left", padx=20, pady=20)
         
-        # Controls
-        ctrl = Frame(self.window, bg="#1e1e1e")
-        ctrl.pack(pady=20)
-        self.start_btn = Button(ctrl, text="START MONITORING", command=self._toggle, font=("Helvetica", 12, "bold"), bg="#00ffcc", fg="black", width=20)
-        self.start_btn.pack(side="left", padx=10)
-        Button(ctrl, text="CALIBRATE", command=self._on_calibrate, font=("Helvetica", 12), bg="#444", fg="white", width=12).pack(side="left", padx=10)
-        Button(ctrl, text="EXIT", command=self._exit, font=("Helvetica", 12), bg="#ff4444", fg="white", width=10).pack(side="left", padx=10)
+        Button(bot, text="RESET LOGS", command=self._reset_logs, font=("Consolas", 10), bg="#333", fg="#fff", width=12, relief="flat").pack(side="right", padx=20)
+
+    def _add_stat(self, title, val, color, row):
+        f = Frame(self.stat_frame, bg="#1a1a1a", pady=10)
+        f.pack(fill="x", pady=5)
+        Label(f, text=title, font=("Consolas", 8), fg="#999", bg="#1a1a1a").pack(side="left", padx=10)
+        lbl = Label(f, text=val, font=("Consolas", 14, "bold"), fg=color, bg="#1a1a1a")
+        lbl.pack(side="right", padx=10)
+        if "DROWSY" in title: self.d_count_lbl = lbl
+        elif "YAWN" in title: self.y_count_lbl = lbl
+        else: self.dist_count_lbl = lbl
 
     def _toggle(self):
-        if self.detector_logic.running:
-            self.detector_logic.stop()
-            self.start_btn.config(text="START MONITORING", bg="#00ffcc")
-            self.status_label.config(text="Status: Paused", fg="white")
+        if not self.agent: return
+        if self.agent.running:
+            self.agent.stop()
+            self.btn_run.config(text="ACTIVATE AGENT", bg="#00ffcc")
         else:
-            self.detector_logic.start()
-            self.start_btn.config(text="STOP MONITORING", bg="#ffcc00")
-            self.status_label.config(text="Status: Active", fg="#00ffcc")
+            self.agent.start()
+            self.btn_run.config(text="DEACTIVATE", bg="#ff4444")
 
-    def _update(self):
+    def _reset_logs(self):
+        if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
+        self.agent.drowsy_count = 0
+        self.agent.yawn_count = 0
+        self.agent.distraction_count = 0
+
+    def _tick(self):
+        if not self.agent:
+            self.vid_lbl.config(text="CAMERA ERROR: COULD NOT INITIALIZE DEVICE\nPlease check connection or privacy settings.", fg="red", font=("Consolas", 14))
+            return
+
         try:
-            res = self.detector_logic.result_queue.get_nowait()
+            p = self.agent.result_queue.get_nowait()
+            
             # Update Video
-            img = Image.fromarray(res['frame'])
+            img = Image.fromarray(p['frame'])
+            # Resize to fit UI while keeping aspect ratio
+            img.thumbnail((750, 500))
             imgtk = ImageTk.PhotoImage(image=img)
-            self.video_label.imgtk = imgtk
-            self.video_label.config(image=imgtk)
+            self.vid_lbl.imgtk = imgtk
+            self.vid_lbl.config(image=imgtk)
             
-            # Update text
-            self.status_label.config(text=f"Status: {res['status']}")
-            # Color coding status
-            if "DROWSY" in res['status']: self.status_label.config(fg="#ff4444")
-            elif "DISTRACTED" in res['status']: self.status_label.config(fg="#cc66ff")
-            elif "CALIBRATING" in res['status']: self.status_label.config(fg="#00ccff")
-            elif "TOO FAR" in res['status']: self.status_label.config(fg="#ffff00")
-            else: self.status_label.config(fg="#00ffcc")
+            # Update Stats
+            self.score_lbl.config(text=f"{p['score']:.0f}%")
+            if p['score'] < 70: self.score_lbl.config(fg="#ffaa00")
+            elif p['score'] < 40: self.score_lbl.config(fg="#ff4444")
+            else: self.score_lbl.config(fg="#00ffcc")
             
-            self.eye_label.config(text=f"Drowsy Events: {res['eye_count']}")
-            self.yawn_label.config(text=f"Yawn Events: {res['yawn_count']}")
-            self.dist_label.config(text=f"Distraction: {res['dist_count']}")
+            dc, yc, dic = p['counts']
+            self.d_count_lbl.config(text=str(dc))
+            self.y_count_lbl.config(text=str(yc))
+            self.dist_count_lbl.config(text=str(dic))
             
-            # Update Direction text
-            p, y, r = res['pose']
-            dir_text = "Center"
-            if y > 25: dir_text = "Looking Left"
-            elif y < -25: dir_text = "Looking Right"
-            elif p > 20: dir_text = "Looking Down"
-            elif p < -20: dir_text = "Looking Up"
-            self.pose_label.config(text=f"Head Angle: {dir_text} (Y:{y:.0f}°, P:{p:.0f}°)")
+            ea, ma = p['ear'], p['mar']
+            te, tm = p['thresholds']
+            self.tel_lbl.config(text=f"EAR: {ea:.3f} (Lim:{te:.2f}) | MAR: {ma:.3f} (Lim:{tm:.2f})")
             
-            self.fps_label.config(text=f"FPS: {res['fps']:.1f}")
-            self.lat_label.config(text=f"Inference: {res['latency']:.1f}ms")
-            self.acc_label.config(text=f"Confidence: {res['accuracy']:.0f}%")
+            self.time_lbl.config(text=f"FPS: {p['fps']:.1f} | SENSOR: {p['status']}")
             
+            night_text = " [NIGHT MODE ACTIVE]" if p['night'] else ""
+            learn_text = f"Status: Learning Baseline...{night_text}" if not self.agent.adapter.is_ready else f"Status: Environmental Sync Active.{night_text}\nLogging to {LOG_FILE}"
+            self.learn_lbl.config(text=learn_text)
+
         except queue.Empty:
             pass
         
-        self.window.after(10, self._update)
-
-    def _exit(self):
-        self.detector_logic.stop()
-        if self.cap: self.cap.release()
-        self.window.quit()
+        self.root.after(10, self._tick)
 
 if __name__ == "__main__":
-    if not os.path.exists(model_path):
-        print(f"Error: {model_path} not found.")
+    if not os.path.exists(MODEL_PATH):
+        print(f"CRITICAL: {MODEL_PATH} missing.")
         sys.exit(1)
         
     root = tk.Tk()
-    app = App(root)
+    app = DRI01App(root)
     root.mainloop()
-    cv2.destroyAllWindows()
