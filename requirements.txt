@@ -5,3 +5,4 @@ numpy==1.26.4
 pyttsx3==2.98
 simpleaudio==1.0.4
 pywin32==306; platform_system == "Windows"
+pytest==8.3.2

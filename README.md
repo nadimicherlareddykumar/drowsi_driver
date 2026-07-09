@@ -58,6 +58,21 @@ python main.py
 - Linux (X11/Wayland environments with camera/audio permissions)
 - macOS
 
+## 🧱 Project Structure
+- `dms/detection/` - detector runtime, landmark math, adaptive thresholds
+- `dms/io/` - TTS/audio queues and session logging
+- `dms/ui/` - Tkinter application layer
+- `dms/config.py` - centralized constants
+- `main.py` - app entrypoint
+
+## 🧪 Tests
+Run unit tests for pure math/adaptation logic:
+```bash
+pytest -q tests
+```
+
+CI (`.github/workflows/tests.yml`) runs these tests on push/PR.
+
 ## 🔒 Privacy, Consent, and Retention
 - Crisis snapshots are stored **locally only** in `crisis_logs/` for safety event review.
 - The app auto-deletes snapshots older than **7 days**.
