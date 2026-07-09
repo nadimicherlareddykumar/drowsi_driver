@@ -148,6 +148,7 @@ MODEL_PATH = 'face_landmarker.task'
 LOG_FILE = 'driver_session_log.csv'
 BASELINE_FILE = 'baseline_profile.json'
 CALIBRATION_SECONDS = 5
+SNAPSHOT_RETENTION_DAYS = 7
 
 # -------------------- Landmark Indices --------------------
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
@@ -215,6 +216,21 @@ class SessionLogger:
             writer = csv.writer(f)
             writer.writerow([timestamp, event_type, duration, details])
 
+
+def cleanup_old_snapshots(directory="crisis_logs", retention_days=SNAPSHOT_RETENTION_DAYS):
+    if not os.path.isdir(directory):
+        return
+    cutoff = time.time() - (retention_days * 24 * 3600)
+    for name in os.listdir(directory):
+        if not name.lower().endswith(".jpg"):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except Exception:
+            logger.exception("Failed to purge old snapshot: %s", path)
+
 # -------------------- Core Agent Engine --------------------
 class DriverAgent:
     def __init__(self, cap):
@@ -222,6 +238,7 @@ class DriverAgent:
         self.running = False
         self.result_queue = queue.Queue(maxsize=1)
         self.logger = SessionLogger(LOG_FILE)
+        cleanup_old_snapshots()
         self.adapter = AdaptiveThresholdManager()
         self.voice = VoiceEngine()
         self.audio = AudioAlertEngine()
