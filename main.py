@@ -16,6 +16,7 @@ from datetime import datetime
 import pyttsx3
 import logging
 import traceback
+import json
 
 try:
     import simpleaudio as sa
@@ -136,6 +137,8 @@ class AudioAlertEngine:
 # -------------------- Mediapipe Task Setup --------------------
 MODEL_PATH = 'face_landmarker.task'
 LOG_FILE = 'driver_session_log.csv'
+BASELINE_FILE = 'baseline_profile.json'
+CALIBRATION_SECONDS = 5
 
 # -------------------- Landmark Indices --------------------
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
@@ -151,26 +154,42 @@ class AdaptiveThresholdManager:
         self.window_size = 300  # ~10 seconds at 30fps
         self.current_ear_threshold = 0.2
         self.current_mar_threshold = 0.6
+        self.min_ear_threshold = 0.12
+        self.max_ear_threshold = 0.35
+        self.min_mar_threshold = 0.35
+        self.max_mar_threshold = 1.2
         self.is_ready = False
 
-    def update(self, raw_ear, raw_mar, is_relaxed=True):
-        if is_relaxed:
+    def apply_clamps(self):
+        self.current_ear_threshold = max(self.min_ear_threshold, min(self.current_ear_threshold, self.max_ear_threshold))
+        self.current_mar_threshold = max(self.min_mar_threshold, min(self.current_mar_threshold, self.max_mar_threshold))
+
+    def set_calibrated_baseline(self, avg_ear, avg_mar):
+        self.current_ear_threshold = avg_ear * 0.72
+        self.current_mar_threshold = avg_mar * 1.65
+        self.apply_clamps()
+        self.is_ready = True
+
+    def update(self, raw_ear, raw_mar, is_eye_relaxed=True, is_mouth_relaxed=True):
+        if is_eye_relaxed:
             self.ear_baseline_history.append(raw_ear)
-            self.mar_baseline_history.append(raw_mar)
-            
             if len(self.ear_baseline_history) > self.window_size:
                 self.ear_baseline_history.pop(0)
+        if is_mouth_relaxed:
+            self.mar_baseline_history.append(raw_mar)
+            if len(self.mar_baseline_history) > self.window_size:
                 self.mar_baseline_history.pop(0)
-                self.is_ready = True
 
-            if self.is_ready:
-                # Set threshold to 70% of the rolling average for eyes
-                avg_ear = sum(self.ear_baseline_history) / len(self.ear_baseline_history)
-                # Set threshold to 160% of the rolling average for mouth
-                avg_mar = sum(self.mar_baseline_history) / len(self.mar_baseline_history)
-                
-                self.current_ear_threshold = avg_ear * 0.72
-                self.current_mar_threshold = avg_mar * 1.65
+        if len(self.ear_baseline_history) >= self.window_size and len(self.mar_baseline_history) >= self.window_size:
+            self.is_ready = True
+
+        if self.ear_baseline_history:
+            avg_ear = sum(self.ear_baseline_history) / len(self.ear_baseline_history)
+            self.current_ear_threshold = avg_ear * 0.72
+        if self.mar_baseline_history:
+            avg_mar = sum(self.mar_baseline_history) / len(self.mar_baseline_history)
+            self.current_mar_threshold = avg_mar * 1.65
+        self.apply_clamps()
 
 # -------------------- Session Logger --------------------
 class SessionLogger:
@@ -202,6 +221,10 @@ class DriverAgent:
         self.thread = None
         self._base_monotonic_ms = int(time.monotonic() * 1000)
         self._last_timestamp_ms = self._base_monotonic_ms
+        self.calibrated = False
+        self.calibrating = False
+        self.calibration_end_time = None
+        self.calibration_samples = {'ear': [], 'mar': [], 'pitch': [], 'yaw': []}
         
         # Detector Setup
         base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
@@ -230,6 +253,8 @@ class DriverAgent:
         # For smoothing UI numbers
         self.smooth_ear = 0.3
         self.smooth_mar = 0.1
+        self.neutral_pose = {'pitch': 0.0, 'yaw': 0.0}
+        self.load_calibration_profile()
 
     def start(self):
         with self.thread_lock:
@@ -268,6 +293,60 @@ class DriverAgent:
 
     def get_error_state(self):
         return self.error_state
+
+    def load_calibration_profile(self):
+        if not os.path.exists(BASELINE_FILE):
+            return
+        try:
+            with open(BASELINE_FILE, 'r', encoding='utf-8') as f:
+                baseline = json.load(f)
+            avg_ear = float(baseline.get('avg_ear', 0.28))
+            avg_mar = float(baseline.get('avg_mar', 0.20))
+            self.neutral_pose = {
+                'pitch': float(baseline.get('neutral_pitch', 0.0)),
+                'yaw': float(baseline.get('neutral_yaw', 0.0))
+            }
+            self.adapter.set_calibrated_baseline(avg_ear, avg_mar)
+            self.calibrated = True
+        except Exception:
+            logger.exception("Failed to load calibration baseline profile.")
+
+    def start_calibration(self, duration_seconds=CALIBRATION_SECONDS):
+        self.calibration_samples = {'ear': [], 'mar': [], 'pitch': [], 'yaw': []}
+        self.calibrating = True
+        self.calibration_end_time = time.time() + duration_seconds
+        self.set_error_state(None)
+
+    def _finalize_calibration(self):
+        if not self.calibration_samples['ear'] or not self.calibration_samples['mar']:
+            self.set_error_state("Calibration failed: insufficient face data.")
+            self.calibrating = False
+            return
+
+        avg_ear = sum(self.calibration_samples['ear']) / len(self.calibration_samples['ear'])
+        avg_mar = sum(self.calibration_samples['mar']) / len(self.calibration_samples['mar'])
+        neutral_pitch = sum(self.calibration_samples['pitch']) / max(1, len(self.calibration_samples['pitch']))
+        neutral_yaw = sum(self.calibration_samples['yaw']) / max(1, len(self.calibration_samples['yaw']))
+
+        self.adapter.set_calibrated_baseline(avg_ear, avg_mar)
+        self.neutral_pose = {'pitch': neutral_pitch, 'yaw': neutral_yaw}
+        payload = {
+            'avg_ear': avg_ear,
+            'avg_mar': avg_mar,
+            'neutral_pitch': neutral_pitch,
+            'neutral_yaw': neutral_yaw,
+            'saved_at': datetime.now().isoformat()
+        }
+        try:
+            with open(BASELINE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=2)
+            self.calibrated = True
+            self.set_error_state("Calibration completed.")
+        except Exception:
+            logger.exception("Failed to persist calibration profile.")
+            self.set_error_state("Calibration completed, but saving profile failed.")
+        finally:
+            self.calibrating = False
 
     def _next_timestamp_ms(self):
         current = int(time.monotonic() * 1000)
@@ -386,7 +465,12 @@ class DriverAgent:
 
                     # Update adaptive thresholds
                     # Only update baseline if the user is NOT currently in an event
-                    self.adapter.update(ear, mar, is_relaxed=(self.eye_closed_start == None))
+                    self.adapter.update(
+                        ear,
+                        mar,
+                        is_eye_relaxed=(self.eye_closed_start is None),
+                        is_mouth_relaxed=(self.mouth_open_start is None)
+                    )
 
                     # Smoothing for UI
                     self.smooth_ear = self.smooth_ear * 0.8 + ear * 0.2
@@ -396,6 +480,37 @@ class DriverAgent:
                     if res.facial_transformation_matrixes:
                         pose = self._get_pose(res.facial_transformation_matrixes[0].data)
                     pitch, yaw, _ = pose
+
+                    if self.calibrating:
+                        self.calibration_samples['ear'].append(ear)
+                        self.calibration_samples['mar'].append(mar)
+                        self.calibration_samples['pitch'].append(pitch)
+                        self.calibration_samples['yaw'].append(yaw)
+                        status = "CALIBRATING..."
+                        frame_draw = self._draw_overlay(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), marks, status, pose)
+                        frame = cv2.cvtColor(frame_draw, cv2.COLOR_BGR2RGB)
+                        if self.calibration_end_time and time.time() >= self.calibration_end_time:
+                            self._finalize_calibration()
+                        inf_time = (time.time() - prev_time)
+                        fps = 1.0 / inf_time if inf_time > 0 else 0
+                        prev_time = time.time()
+                        res_pkg = {
+                            'frame': frame,
+                            'status': status,
+                            'fps': fps,
+                            'ear': self.smooth_ear,
+                            'mar': self.smooth_mar,
+                            'score': self.alertness_score,
+                            'counts': (self.drowsy_count, self.yawn_count, self.distraction_count),
+                            'pose': pose,
+                            'thresholds': (self.adapter.current_ear_threshold, self.adapter.current_mar_threshold),
+                            'night': night_mode
+                        }
+                        if self.result_queue.full():
+                            try: self.result_queue.get_nowait()
+                            except: pass
+                        self.result_queue.put(res_pkg)
+                        continue
 
                     # --- DETECTION LOGIC ---
                     curr_status = "Active"
@@ -463,7 +578,12 @@ class DriverAgent:
                     if len(self.closure_history) > 600: self.closure_history.pop(0)
                     if len(self.closure_history) > 0:
                         perclos = (sum(self.closure_history) / len(self.closure_history)) * 100
-                        self.alertness_score = max(0, 100 - (perclos * 5)) # Weighted reduction
+                        if perclos <= 20:
+                            self.alertness_score = 100.0
+                        elif perclos >= 80:
+                            self.alertness_score = 0.0
+                        else:
+                            self.alertness_score = ((80 - perclos) / 60.0) * 100.0
 
                 else:
                     if self.face_missing_start is None:
@@ -605,6 +725,7 @@ class DRI01App:
         self.btn_run.pack(side="left", padx=20, pady=20)
         
         Button(bot, text="RESET LOGS", command=self._reset_logs, font=("Consolas", 10), bg="#333", fg="#fff", width=12, relief="flat").pack(side="right", padx=20)
+        Button(bot, text="CALIBRATE", command=self._calibrate, font=("Consolas", 10, "bold"), bg="#ffaa00", fg="#000", width=12, relief="flat").pack(side="right", padx=10)
 
     def _add_stat(self, title, val, color, row):
         f = Frame(self.stat_frame, bg="#1a1a1a", pady=10)
@@ -622,8 +743,18 @@ class DRI01App:
             self.agent.stop()
             self.btn_run.config(text="ACTIVATE AGENT", bg="#00ffcc")
         else:
+            if not self.agent.calibrated:
+                self.learn_lbl.config(text=f"Calibration required: press CALIBRATE for {CALIBRATION_SECONDS}s before monitoring.")
+                return
             self.agent.start()
             self.btn_run.config(text="DEACTIVATE", bg="#ff4444")
+
+    def _calibrate(self):
+        if not self.agent:
+            return
+        if not self.agent.running:
+            self.agent.start()
+        self.agent.start_calibration(CALIBRATION_SECONDS)
 
     def _reset_logs(self):
         if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
@@ -670,7 +801,13 @@ class DRI01App:
             self.time_lbl.config(text=f"FPS: {p['fps']:.1f} | SENSOR: {p['status']}")
             
             night_text = " [NIGHT MODE ACTIVE]" if p['night'] else ""
-            learn_text = f"Status: Learning Baseline...{night_text}" if not self.agent.adapter.is_ready else f"Status: Environmental Sync Active.{night_text}\nLogging to {LOG_FILE}"
+            if self.agent.calibrating:
+                remaining = max(0, int(self.agent.calibration_end_time - time.time())) if self.agent.calibration_end_time else 0
+                learn_text = f"Status: Calibrating... {remaining}s remaining{night_text}"
+            elif not self.agent.calibrated:
+                learn_text = f"Status: Not calibrated. Press CALIBRATE ({CALIBRATION_SECONDS}s){night_text}"
+            else:
+                learn_text = f"Status: Environmental Sync Active.{night_text}\nLogging to {LOG_FILE}"
             if runtime_error:
                 learn_text = f"Status: RECOVERING - {runtime_error}\n{learn_text}"
             self.learn_lbl.config(text=learn_text)
