@@ -1,0 +1,6 @@
+crisis_logs/*
+!crisis_logs/.gitkeep
+driver_session_log.csv
+__pycache__/
+*.pyc
+baseline_profile.json
