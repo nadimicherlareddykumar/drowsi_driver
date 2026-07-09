@@ -21,10 +21,22 @@ A real-time driver safety application that monitors drowsiness, yawning, and dis
 ## 🚀 Getting Started
 
 ### 1. Installation
-Clone the repository and install the dependencies:
+Clone the repository and install dependencies using either:
+
 ```bash
-pip install mediapipe opencv-python Pillow numpy
+python setup_env.py
 ```
+
+or manually:
+
+```bash
+pip install -r requirements.txt
+```
+
+#### OS-specific notes
+- **Windows**: `pywin32` is installed automatically for TTS COM support.
+- **Linux**: install `espeak` if pyttsx3 speech backend is missing (example: `sudo apt-get install espeak`).
+- **macOS**: pyttsx3 uses built-in system voices in most setups.
 
 ### 2. Model Download
 The system requires the `face_landmarker.task` model. If not present, download it from Google's MediaPipe storage:
@@ -36,9 +48,15 @@ Run the application:
 python main.py
 ```
 
-- Click **START MONITORING** to begin the camera feed.
-- Click **CALIBRATE** and look straight at the camera for 3 seconds for optimal accuracy.
+- Click **CALIBRATE** and look straight at the camera for 5 seconds to build baseline data (saved to `baseline_profile.json`).
+- Click **ACTIVATE AGENT** to begin active monitoring after calibration.
+- Use **DEACTIVATE** to pause and **RESET LOGS** to reset counters/log file.
 - Watch the **Status** bar and listen for alerts!
+
+## ✅ Supported Platforms
+- Windows 10/11
+- Linux (X11/Wayland environments with camera/audio permissions)
+- macOS
 
 ## 🛡️ License
 MIT License

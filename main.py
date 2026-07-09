@@ -36,6 +36,8 @@ class VoiceEngine:
         self.running = True
         self.last_voice_time = 0
         self.lock = threading.Lock()
+        self.available = True
+        self.last_error = None
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
@@ -67,6 +69,8 @@ class VoiceEngine:
                 except Exception:
                     logger.exception("TTS playback failed.")
         except Exception:
+            self.available = False
+            self.last_error = "TTS backend unavailable. Install a speech backend (e.g., espeak on Linux)."
             logger.exception("Voice engine worker initialization failed.")
         finally:
             try:
@@ -83,6 +87,8 @@ class VoiceEngine:
 
     def say(self, text, cooldown=3):
         """Speaks the text only if the cooldown has passed."""
+        if not self.available:
+            return
         now = time.time()
         with self.lock:
             if now - self.last_voice_time > cooldown:
@@ -99,6 +105,8 @@ class AudioAlertEngine:
     def __init__(self):
         self.queue = queue.Queue()
         self.running = True
+        self.available = sa is not None
+        self.last_error = None if self.available else "Audio backend unavailable. Install simpleaudio."
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
@@ -120,12 +128,13 @@ class AudioAlertEngine:
                 break
             freq_hz, duration_ms, volume = item
             try:
-                if sa is None:
+                if not self.available or sa is None:
                     continue
                 audio_bytes, sample_rate = self._generate_tone(freq_hz, duration_ms, volume)
                 play_obj = sa.play_buffer(audio_bytes, 1, 2, sample_rate)
                 play_obj.wait_done()
             except Exception:
+                self.last_error = "Audio playback failed. Check output device/backend."
                 logger.exception("Audio alert playback failed.")
 
     def close(self):
@@ -255,6 +264,11 @@ class DriverAgent:
         self.smooth_mar = 0.1
         self.neutral_pose = {'pitch': 0.0, 'yaw': 0.0}
         self.load_calibration_profile()
+        self.system_warnings = []
+        if self.voice.last_error:
+            self.system_warnings.append(self.voice.last_error)
+        if self.audio.last_error:
+            self.system_warnings.append(self.audio.last_error)
 
     def start(self):
         with self.thread_lock:
@@ -640,7 +654,7 @@ class DRI01App:
             self.agent = DriverAgent(self.cap)
         else:
             self.agent = None
-            print("CRITICAL: All camera initialization attempts failed.")
+            logger.critical("All camera initialization attempts failed.")
         
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -663,14 +677,14 @@ class DRI01App:
                     # Verification read
                     ret, _ = cap.read()
                     if ret:
-                        print(f"Camera initialized successfully on index {idx} with backend {backend}")
+                        logger.info("Camera initialized on index %s backend %s", idx, backend)
                         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                         return cap
                     cap.release()
             except Exception as e:
-                print(f"Failed to init camera {idx} with {backend}: {e}")
+                logger.exception("Failed to init camera %s with backend %s: %s", idx, backend, e)
                 continue
         return None
 
@@ -808,6 +822,8 @@ class DRI01App:
                 learn_text = f"Status: Not calibrated. Press CALIBRATE ({CALIBRATION_SECONDS}s){night_text}"
             else:
                 learn_text = f"Status: Environmental Sync Active.{night_text}\nLogging to {LOG_FILE}"
+            if self.agent.system_warnings:
+                learn_text = f"{learn_text}\nWarning: {' | '.join(self.agent.system_warnings)}"
             if runtime_error:
                 learn_text = f"Status: RECOVERING - {runtime_error}\n{learn_text}"
             self.learn_lbl.config(text=learn_text)
@@ -826,7 +842,7 @@ class DRI01App:
 
 if __name__ == "__main__":
     if not os.path.exists(MODEL_PATH):
-        print(f"CRITICAL: {MODEL_PATH} missing.")
+        logger.critical("%s missing.", MODEL_PATH)
         sys.exit(1)
         
     root = tk.Tk()

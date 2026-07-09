@@ -1,4 +1,7 @@
-mediapipe
-opencv-python
-Pillow
-numpy
+mediapipe==0.10.14
+opencv-python==4.10.0.84
+Pillow==10.4.0
+numpy==1.26.4
+pyttsx3==2.98
+simpleaudio==1.0.4
+pywin32==306; platform_system == "Windows"
