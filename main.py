@@ -11,35 +11,127 @@ import os
 import time
 import threading
 import queue
-import winsound
 import csv
 from datetime import datetime
 import pyttsx3
+import logging
+import traceback
+
+try:
+    import simpleaudio as sa
+except Exception:
+    sa = None
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("dri01")
 
 # -------------------- Voice Engine --------------------
 class VoiceEngine:
     def __init__(self):
-        self.engine = pyttsx3.init()
-        # Set property for a clearer voice
-        voices = self.engine.getProperty('voices')
-        if len(voices) > 1:
-            # Usually voice[1] is female which sounds clearer for navigation/assistants
-            self.engine.setProperty('voice', voices[1].id)
-        self.engine.setProperty('rate', 160)
+        self.queue = queue.Queue()
+        self.running = True
         self.last_voice_time = 0
+        self.lock = threading.Lock()
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def _worker(self):
+        com_initialized = False
+        engine = None
+        try:
+            if sys.platform.startswith("win"):
+                try:
+                    import pythoncom
+                    pythoncom.CoInitialize()
+                    com_initialized = True
+                except Exception:
+                    logger.warning("pythoncom not available; Windows COM init skipped for TTS worker.")
+
+            engine = pyttsx3.init()
+            voices = engine.getProperty('voices')
+            if len(voices) > 1:
+                engine.setProperty('voice', voices[1].id)
+            engine.setProperty('rate', 160)
+
+            while self.running:
+                msg = self.queue.get()
+                if msg is None:
+                    break
+                try:
+                    engine.say(msg)
+                    engine.runAndWait()
+                except Exception:
+                    logger.exception("TTS playback failed.")
+        except Exception:
+            logger.exception("Voice engine worker initialization failed.")
+        finally:
+            try:
+                if engine is not None:
+                    engine.stop()
+            except Exception:
+                pass
+            if com_initialized:
+                try:
+                    import pythoncom
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    logger.exception("Failed to uninitialize COM in TTS worker.")
 
     def say(self, text, cooldown=3):
         """Speaks the text only if the cooldown has passed."""
-        if time.time() - self.last_voice_time > cooldown:
-            def _speak():
-                try:
-                    engine = pyttsx3.init()
-                    engine.say(text)
-                    engine.runAndWait()
-                except:
-                    pass
-            threading.Thread(target=_speak, daemon=True).start()
-            self.last_voice_time = time.time()
+        now = time.time()
+        with self.lock:
+            if now - self.last_voice_time > cooldown:
+                self.queue.put(text)
+                self.last_voice_time = now
+
+    def close(self):
+        self.running = False
+        self.queue.put(None)
+        if self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+
+class AudioAlertEngine:
+    def __init__(self):
+        self.queue = queue.Queue()
+        self.running = True
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def play_tone(self, freq_hz=1500, duration_ms=150, volume=0.25):
+        self.queue.put((freq_hz, duration_ms, volume))
+
+    def _generate_tone(self, freq_hz, duration_ms, volume):
+        sample_rate = 44100
+        samples = int(sample_rate * (duration_ms / 1000.0))
+        t = np.linspace(0, duration_ms / 1000.0, samples, False)
+        wave = np.sin(freq_hz * t * 2 * np.pi)
+        audio = (wave * (32767 * volume)).astype(np.int16)
+        return audio.tobytes(), sample_rate
+
+    def _worker(self):
+        while self.running:
+            item = self.queue.get()
+            if item is None:
+                break
+            freq_hz, duration_ms, volume = item
+            try:
+                if sa is None:
+                    continue
+                audio_bytes, sample_rate = self._generate_tone(freq_hz, duration_ms, volume)
+                play_obj = sa.play_buffer(audio_bytes, 1, 2, sample_rate)
+                play_obj.wait_done()
+            except Exception:
+                logger.exception("Audio alert playback failed.")
+
+    def close(self):
+        self.running = False
+        self.queue.put(None)
+        if self.thread.is_alive():
+            self.thread.join(timeout=2.0)
 
 # -------------------- Mediapipe Task Setup --------------------
 MODEL_PATH = 'face_landmarker.task'
@@ -104,6 +196,12 @@ class DriverAgent:
         self.logger = SessionLogger(LOG_FILE)
         self.adapter = AdaptiveThresholdManager()
         self.voice = VoiceEngine()
+        self.audio = AudioAlertEngine()
+        self.thread_lock = threading.Lock()
+        self.error_state = None
+        self.thread = None
+        self._base_monotonic_ms = int(time.monotonic() * 1000)
+        self._last_timestamp_ms = self._base_monotonic_ms
         
         # Detector Setup
         base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
@@ -111,7 +209,8 @@ class DriverAgent:
             base_options=base_options,
             output_face_blendshapes=True,
             output_facial_transformation_matrixes=True,
-            num_faces=1
+            num_faces=1,
+            running_mode=vision.RunningMode.VIDEO
         )
         self.detector = vision.FaceLandmarker.create_from_options(options)
 
@@ -133,12 +232,49 @@ class DriverAgent:
         self.smooth_mar = 0.1
 
     def start(self):
-        self.running = True
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
+        with self.thread_lock:
+            if self.thread is not None and self.thread.is_alive():
+                return
+            self.running = True
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
 
     def stop(self):
         self.running = False
+        with self.thread_lock:
+            if self.thread is not None and self.thread.is_alive():
+                self.thread.join(timeout=2.0)
+
+    def close(self):
+        self.stop()
+        try:
+            self.detector.close()
+        except Exception:
+            logger.exception("Failed to close detector.")
+        self.voice.close()
+        self.audio.close()
+
+    def is_alive(self):
+        with self.thread_lock:
+            return self.thread is not None and self.thread.is_alive()
+
+    def restart(self):
+        self.set_error_state("Detector thread restarted after failure.")
+        self.stop()
+        self.start()
+
+    def set_error_state(self, message):
+        self.error_state = message
+
+    def get_error_state(self):
+        return self.error_state
+
+    def _next_timestamp_ms(self):
+        current = int(time.monotonic() * 1000)
+        if current <= self._last_timestamp_ms:
+            current = self._last_timestamp_ms + 1
+        self._last_timestamp_ms = current
+        return current
 
     def _calculate_metrics(self, landmarks, w, h):
         # EAR calculation
@@ -227,144 +363,149 @@ class DriverAgent:
     def _run(self):
         prev_time = time.time()
         while self.running:
-            success, raw_frame = self.cap.read()
-            if not success: continue
+            try:
+                success, raw_frame = self.cap.read()
+                if not success:
+                    continue
 
-            # Night Vision Enhancement
-            frame, night_mode = self._apply_night_vision(raw_frame)
+                # Night Vision Enhancement
+                frame, night_mode = self._apply_night_vision(raw_frame)
 
-            img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
-            res = self.detector.detect(mp_img)
-            
-            status = "Continuous Learning..."
-            h, w, _ = frame.shape
-            pose = (0, 0, 0)
-            
-            if res.face_landmarks:
-                self.face_missing_start = None
-                marks = res.face_landmarks[0]
-                ear, mar = self._calculate_metrics(marks, w, h)
-                
-                # Update adaptive thresholds
-                # Only update baseline if the user is NOT currently in an event
-                self.adapter.update(ear, mar, is_relaxed=(self.eye_closed_start == None))
-                
-                # Smoothing for UI
-                self.smooth_ear = self.smooth_ear * 0.8 + ear * 0.2
-                self.smooth_mar = self.smooth_mar * 0.8 + mar * 0.2
-                
-                # Head Pose
-                if res.facial_transformation_matrixes:
-                    pose = self._get_pose(res.facial_transformation_matrixes[0].data)
-                
-                pitch, yaw, _ = pose
-                
-                # --- DETECTION LOGIC ---
-                curr_status = "Active"
-                
-                # 1. Drowsiness (EAR)
-                if ear < self.adapter.current_ear_threshold:
-                    if self.eye_closed_start is None: self.eye_closed_start = time.time()
-                    duration = time.time() - self.eye_closed_start
-                    if duration > 1.0: # 1 second threshold
-                        curr_status = "DROWSY - WAKE UP!"
-                        winsound.Beep(2000, 200)
-                        self.voice.say("Drowsiness detected. Open your eyes.")
-                        self.closure_history.append(1)
-                        if duration > 2.5 and not hasattr(self, '_snap_done'):
-                            self._take_snapshot(img_rgb, "DROWSY")
-                            self._snap_done = True
-                    else: self.closure_history.append(0)
+                img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+                res = self.detector.detect_for_video(mp_img, self._next_timestamp_ms())
+
+                status = "Continuous Learning..."
+                h, w, _ = frame.shape
+                pose = (0, 0, 0)
+
+                if res.face_landmarks:
+                    self.face_missing_start = None
+                    marks = res.face_landmarks[0]
+                    ear, mar = self._calculate_metrics(marks, w, h)
+
+                    # Update adaptive thresholds
+                    # Only update baseline if the user is NOT currently in an event
+                    self.adapter.update(ear, mar, is_relaxed=(self.eye_closed_start == None))
+
+                    # Smoothing for UI
+                    self.smooth_ear = self.smooth_ear * 0.8 + ear * 0.2
+                    self.smooth_mar = self.smooth_mar * 0.8 + mar * 0.2
+
+                    # Head Pose
+                    if res.facial_transformation_matrixes:
+                        pose = self._get_pose(res.facial_transformation_matrixes[0].data)
+                    pitch, yaw, _ = pose
+
+                    # --- DETECTION LOGIC ---
+                    curr_status = "Active"
+
+                    # 1. Drowsiness (EAR)
+                    if ear < self.adapter.current_ear_threshold:
+                        if self.eye_closed_start is None: self.eye_closed_start = time.time()
+                        duration = time.time() - self.eye_closed_start
+                        if duration > 1.0: # 1 second threshold
+                            curr_status = "DROWSY - WAKE UP!"
+                            self.audio.play_tone(2000, 200)
+                            self.voice.say("Drowsiness detected. Open your eyes.")
+                            self.closure_history.append(1)
+                            if duration > 2.5 and not hasattr(self, '_snap_done'):
+                                self._take_snapshot(img_rgb, "DROWSY")
+                                self._snap_done = True
+                        else: self.closure_history.append(0)
+                    else:
+                        if hasattr(self, '_snap_done'): delattr(self, '_snap_done')
+                        if self.eye_closed_start:
+                            dur = time.time() - self.eye_closed_start
+                            if dur > 1.0:
+                                self.drowsy_count += 1
+                                self.logger.log_event("DROWSY", round(dur, 2), f"EAR: {ear:.2f}")
+                                if self.drowsy_count % 3 == 0:
+                                    self.voice.say("You have multiple drowsy events. Please consider a coffee break.")
+                        self.eye_closed_start = None
+                        self.closure_history.append(0)
+
+                    # 2. Yawning (MAR)
+                    if mar > self.adapter.current_mar_threshold:
+                        if self.mouth_open_start is None: self.mouth_open_start = time.time()
+                        if (time.time() - self.mouth_open_start) > 2.0:
+                            curr_status = "YAWNING DETECTED"
+                            self.audio.play_tone(1000, 100)
+                            self.voice.say("Yawning detected. Fatigue is increasing.")
+                    else:
+                        if self.mouth_open_start:
+                            dur = time.time() - self.mouth_open_start
+                            if dur > 2.0:
+                                self.yawn_count += 1
+                                self.logger.log_event("YAWN", round(dur, 2))
+                        self.mouth_open_start = None
+
+                    # 3. Distraction (Pose)
+                    if abs(yaw) > 25 or abs(pitch) > 18:
+                        if self.distracted_start is None: self.distracted_start = time.time()
+                        if (time.time() - self.distracted_start) > 1.5:
+                            curr_status = "WATCH THE ROAD!"
+                            self.audio.play_tone(1500, 150)
+                            self.voice.say("Keep your eyes on the road.")
+                    else:
+                        if self.distracted_start:
+                            dur = time.time() - self.distracted_start
+                            if dur > 1.5:
+                                self.distraction_count += 1
+                                self.logger.log_event("DISTRACTION", round(dur, 2), f"Yaw: {yaw:.0f}")
+                        self.distracted_start = None
+
+                    status = curr_status
+                    frame_draw = self._draw_overlay(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), marks, status, pose)
+                    frame = cv2.cvtColor(frame_draw, cv2.COLOR_BGR2RGB)
+
+                    # Calculate Alertness Score (PERCLOS)
+                    if len(self.closure_history) > 600: self.closure_history.pop(0)
+                    if len(self.closure_history) > 0:
+                        perclos = (sum(self.closure_history) / len(self.closure_history)) * 100
+                        self.alertness_score = max(0, 100 - (perclos * 5)) # Weighted reduction
+
                 else:
-                    if hasattr(self, '_snap_done'): delattr(self, '_snap_done')
-                    if self.eye_closed_start:
-                        dur = time.time() - self.eye_closed_start
-                        if dur > 1.0:
-                            self.drowsy_count += 1
-                            self.logger.log_event("DROWSY", round(dur, 2), f"EAR: {ear:.2f}")
-                            if self.drowsy_count % 3 == 0:
-                                self.voice.say("You have multiple drowsy events. Please consider a coffee break.")
-                    self.eye_closed_start = None
+                    if self.face_missing_start is None:
+                        self.face_missing_start = time.time()
+
+                    missing_dur = time.time() - self.face_missing_start
+                    if missing_dur > 1.5:
+                        status = "FACE OBSTRUCTED / MISSING"
+                        self.audio.play_tone(2500, 200)
+                        self.voice.say("Face obstructed. Please keep your face visible.")
+                    else:
+                        status = "Searching for face..."
+
                     self.closure_history.append(0)
+                    if len(self.closure_history) > 600: self.closure_history.pop(0)
 
-                # 2. Yawning (MAR)
-                if mar > self.adapter.current_mar_threshold:
-                    if self.mouth_open_start is None: self.mouth_open_start = time.time()
-                    if (time.time() - self.mouth_open_start) > 2.0:
-                        curr_status = "YAWNING DETECTED"
-                        winsound.Beep(1000, 100)
-                        self.voice.say("Yawning detected. Fatigue is increasing.")
-                else:
-                    if self.mouth_open_start:
-                        dur = time.time() - self.mouth_open_start
-                        if dur > 2.0:
-                            self.yawn_count += 1
-                            self.logger.log_event("YAWN", round(dur, 2))
-                    self.mouth_open_start = None
+                # Package result
+                inf_time = (time.time() - prev_time)
+                fps = 1.0 / inf_time if inf_time > 0 else 0
+                prev_time = time.time()
 
-                # 3. Distraction (Pose)
-                if abs(yaw) > 25 or abs(pitch) > 18:
-                    if self.distracted_start is None: self.distracted_start = time.time()
-                    if (time.time() - self.distracted_start) > 1.5:
-                        curr_status = "WATCH THE ROAD!"
-                        winsound.Beep(1500, 150)
-                        self.voice.say("Keep your eyes on the road.")
-                else:
-                    if self.distracted_start:
-                        dur = time.time() - self.distracted_start
-                        if dur > 1.5:
-                            self.distraction_count += 1
-                            self.logger.log_event("DISTRACTION", round(dur, 2), f"Yaw: {yaw:.0f}")
-                    self.distracted_start = None
-                
-                status = curr_status
-                frame_draw = self._draw_overlay(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), marks, status, pose)
-                frame = cv2.cvtColor(frame_draw, cv2.COLOR_BGR2RGB)
-                
-                # Calculate Alertness Score (PERCLOS)
-                if len(self.closure_history) > 600: self.closure_history.pop(0)
-                if len(self.closure_history) > 0:
-                    perclos = (sum(self.closure_history) / len(self.closure_history)) * 100
-                    self.alertness_score = max(0, 100 - (perclos * 5)) # Weighted reduction
+                res_pkg = {
+                    'frame': frame,
+                    'status': status,
+                    'fps': fps,
+                    'ear': self.smooth_ear,
+                    'mar': self.smooth_mar,
+                    'score': self.alertness_score,
+                    'counts': (self.drowsy_count, self.yawn_count, self.distraction_count),
+                    'pose': pose,
+                    'thresholds': (self.adapter.current_ear_threshold, self.adapter.current_mar_threshold),
+                    'night': night_mode
+                }
 
-            else:
-                if self.face_missing_start is None:
-                    self.face_missing_start = time.time()
-                
-                missing_dur = time.time() - self.face_missing_start
-                if missing_dur > 1.5:
-                    status = "FACE OBSTRUCTED / MISSING"
-                    winsound.Beep(2500, 200)
-                    self.voice.say("Face obstructed. Please keep your face visible.")
-                else:
-                    status = "Searching for face..."
-                
-                self.closure_history.append(0)
-                if len(self.closure_history) > 600: self.closure_history.pop(0)
-
-            # Package result
-            inf_time = (time.time() - prev_time)
-            fps = 1.0 / inf_time if inf_time > 0 else 0
-            prev_time = time.time()
-            
-            res_pkg = {
-                'frame': frame,
-                'status': status,
-                'fps': fps,
-                'ear': self.smooth_ear,
-                'mar': self.smooth_mar,
-                'score': self.alertness_score,
-                'counts': (self.drowsy_count, self.yawn_count, self.distraction_count),
-                'pose': pose,
-                'thresholds': (self.adapter.current_ear_threshold, self.adapter.current_mar_threshold),
-                'night': night_mode
-            }
-            
-            if self.result_queue.full():
-                try: self.result_queue.get_nowait()
-                except: pass
-            self.result_queue.put(res_pkg)
+                if self.result_queue.full():
+                    try: self.result_queue.get_nowait()
+                    except: pass
+                self.result_queue.put(res_pkg)
+            except Exception:
+                self.set_error_state("Detection loop recovered from an internal error.")
+                logger.exception("Detector loop error:\n%s", traceback.format_exc())
+                time.sleep(0.05)
 
 # -------------------- GUI --------------------
 class DRI01App:
@@ -382,6 +523,7 @@ class DRI01App:
             print("CRITICAL: All camera initialization attempts failed.")
         
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._tick()
 
     def _init_cap(self):
@@ -402,6 +544,9 @@ class DRI01App:
                     ret, _ = cap.read()
                     if ret:
                         print(f"Camera initialized successfully on index {idx} with backend {backend}")
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                         return cap
                     cap.release()
             except Exception as e:
@@ -491,6 +636,11 @@ class DRI01App:
             self.vid_lbl.config(text="CAMERA ERROR: COULD NOT INITIALIZE DEVICE\nPlease check connection or privacy settings.", fg="red", font=("Consolas", 14))
             return
 
+        if self.agent.running and not self.agent.is_alive():
+            self.agent.restart()
+
+        runtime_error = self.agent.get_error_state()
+
         try:
             p = self.agent.result_queue.get_nowait()
             
@@ -521,12 +671,21 @@ class DRI01App:
             
             night_text = " [NIGHT MODE ACTIVE]" if p['night'] else ""
             learn_text = f"Status: Learning Baseline...{night_text}" if not self.agent.adapter.is_ready else f"Status: Environmental Sync Active.{night_text}\nLogging to {LOG_FILE}"
+            if runtime_error:
+                learn_text = f"Status: RECOVERING - {runtime_error}\n{learn_text}"
             self.learn_lbl.config(text=learn_text)
 
         except queue.Empty:
             pass
         
         self.root.after(10, self._tick)
+
+    def _on_close(self):
+        if self.agent:
+            self.agent.close()
+        if self.cap:
+            self.cap.release()
+        self.root.destroy()
 
 if __name__ == "__main__":
     if not os.path.exists(MODEL_PATH):
